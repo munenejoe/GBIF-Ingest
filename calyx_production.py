@@ -321,7 +321,6 @@ async def fetch_gbif_species(
     already_processed = checkpoint.get_order_count(order_name)
     if already_processed > 0:
         logger.info(f"  ↻ Resuming from {already_processed} processed species")
-        offset = already_processed
     
     while len(all_species) < limit:
         params = {
@@ -1221,142 +1220,130 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Extract single batch
   python calyx_production.py --batch 1 --limit 5000
-  
-  # Extract specific orders
   python calyx_production.py --orders Asterales Rosales --limit 10000
-  
-  # Extract all batches
   python calyx_production.py --all --limit 50000
-  
-  # Resume from checkpoint
   python calyx_production.py --batch 1 --limit 5000 --resume
         """
     )
-    
-    parser.add_argument(
-        '--batch',
-        type=int,
-        choices=range(1, 10),
-        help='Batch number to extract (1-9)'
-    )
-    parser.add_argument(
-        '--orders',
-        nargs='+',
-        help='Specific order names to extract'
-    )
-    parser.add_argument(
-        '--all',
-        action='store_true',
-        help='Extract all batches sequentially'
-    )
-    parser.add_argument(
-        '--limit',
-        type=int,
-        default=10000,
-        help='Max species per order (default: 10000)'
-    )
-    parser.add_argument(
-        '--output',
-        type=str,
-        default='calyx_species_data.csv',
-        help='Output CSV filename'
-    )
-    parser.add_argument(
-        '--checkpoint',
-        type=str,
-        default='calyx_checkpoint.json',
-        help='Checkpoint file for resume capability'
-    )
-    parser.add_argument(
-        '--log-file',
-        type=str,
-        help='Optional log file path'
-    )
-    parser.add_argument(
-        '--resume',
-        action='store_true',
-        help='Resume from checkpoint (auto-detected if checkpoint exists)'
-    )
-    
+
+    parser.add_argument('--batch', type=int, choices=range(1, 10))
+    parser.add_argument('--orders', nargs='+')
+    parser.add_argument('--all', action='store_true')
+
+    # 👇 change default to None so we can control it
+    parser.add_argument('--limit', type=int, default=None)
+
+    parser.add_argument('--output', type=str, default='calyx_species_data.csv')
+    parser.add_argument('--checkpoint', type=str, default='calyx_checkpoint.json')
+    parser.add_argument('--log-file', type=str)
+    parser.add_argument('--resume', action='store_true')
+
     args = parser.parse_args()
-    
-    # Validation
+
     if not any([args.batch, args.orders, args.all]):
         parser.print_help()
         print("\n❌ Error: Specify --batch, --orders, or --all")
         sys.exit(1)
-    
+
+    # =========================
+    # 🔥 SMART LIMIT HANDLING
+    # =========================
+    if args.limit is None:
+        if args.resume:
+            args.limit = 200000
+            print("♻️ Resume detected → using high limit: 200,000")
+        else:
+            args.limit = 50000
+            print("🚀 Default run → using safe limit: 50,000")
+
     # Setup logging
     global logger
     logger = setup_logging(args.log_file)
-    
-    # Initialize components
+
+    # Init components
     checkpoint = CheckpointManager(args.checkpoint)
     wiki_cache = WikipediaCache()
     csv_writer = StreamingCSVWriter(args.output)
-    
+
     logger.info("🌺 CALYX PRODUCTION DATA EXTRACTION PIPELINE 🌺")
     logger.info(f"Output: {args.output}")
     logger.info(f"Checkpoint: {args.checkpoint}")
     logger.info(f"Limit per order: {args.limit:,}")
     logger.info(f"Max concurrent Wikipedia: {MAX_CONCURRENT_WIKI}")
-    
+
     start_time = time.time()
-    
-    # Determine what to extract
+
+    # =========================
+    # ✅ ASYNC EXECUTION LAYER
+    # =========================
+
+    async def run_all_batches():
+        for batch_num in range(1, 10):
+            try:
+                logger.info(f"\n🚀 Starting batch {batch_num}")
+                await extract_batch(
+                    batch_num, args.limit, checkpoint, wiki_cache, csv_writer
+                )
+            except Exception as e:
+                logger.error(f"❌ Batch {batch_num} failed: {e}", exc_info=True)
+
+    async def run_single_batch():
+        await extract_batch(
+            args.batch, args.limit, checkpoint, wiki_cache, csv_writer
+        )
+
+    async def run_custom_orders():
+        order_keys = sync_backbone_keys(args.orders)
+        for order_name, order_key in order_keys.items():
+            try:
+                await extract_order_parallel(
+                    order_name, order_key, args.limit,
+                    checkpoint, wiki_cache, csv_writer
+                )
+            except Exception as e:
+                logger.error(f"❌ Order {order_name} failed: {e}")
+
+    # =========================
+    # ✅ EXECUTION SWITCH
+    # =========================
+
     try:
         if args.all:
-            # Extract all batches
-            for batch_num in range(1, 10):
-                asyncio.run(extract_batch(
-                    batch_num, args.limit, checkpoint, wiki_cache, csv_writer
-                ))
-        
+            asyncio.run(run_all_batches())
+
         elif args.batch:
-            # Extract single batch
-            asyncio.run(extract_batch(
-                args.batch, args.limit, checkpoint, wiki_cache, csv_writer
-            ))
-        
+            asyncio.run(run_single_batch())
+
         elif args.orders:
-            # Extract specific orders
-            order_keys = sync_backbone_keys(args.orders)
-            
-            async def extract_custom_orders():
-                for order_name, order_key in order_keys.items():
-                    await extract_order_parallel(
-                        order_name, order_key, args.limit,
-                        checkpoint, wiki_cache, csv_writer
-                    )
-            
-            asyncio.run(extract_custom_orders())
-        
+            asyncio.run(run_custom_orders())
+
         # Final saves
         checkpoint.save()
         wiki_cache.save()
-        
-        # Summary
+
         elapsed = (time.time() - start_time) / 60
+
         logger.info(f"\n{'='*80}")
         logger.info("✨ EXTRACTION COMPLETE!")
         logger.info(f"{'='*80}")
         logger.info(f"📁 Output: {args.output}")
         logger.info(f"⏱️  Time: {elapsed:.2f} minutes")
         logger.info(f"✅ Success!")
-        
+
     except KeyboardInterrupt:
-        logger.warning("\n⚠️  Interrupted by user")
+        logger.warning("\n⚠️ Interrupted by user")
         checkpoint.save()
         wiki_cache.save()
-        logger.info("💾 Progress saved. Resume with --resume flag")
+        logger.info("💾 Progress saved. Resume anytime.")
         sys.exit(1)
+
     except Exception as e:
         logger.error(f"\n❌ Fatal error: {e}", exc_info=True)
         checkpoint.save()
         wiki_cache.save()
         sys.exit(1)
+
 
 if __name__ == "__main__":
     main()

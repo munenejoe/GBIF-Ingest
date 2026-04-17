@@ -20,5 +20,5 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy the rest of the code
 COPY . .
 
-# Default command (can override in docker run)
+# Default command for sample - adjust for production (can override in docker run) - currently set to collect 5000 samples in batch of 1 for testing
 CMD ["python", "calyx_production.py", "--batch", "1", "--limit", "5000"]
