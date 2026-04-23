@@ -84,7 +84,9 @@ class SpeciesRecord:
     wikipedia_description: str
     description_source: str  # "species", "cleaned", "genus", "none"
     extraction_timestamp: str
-    image_urls: str  # now JSON: [{"url": "...", "source": "inat|wiki"}]
+    inat_research_images: str
+    inat_needs_id_images: str
+    wiki_images: str
 
     def to_dict(self):
         """Convert to dictionary for CSV writing."""
@@ -217,6 +219,52 @@ class CheckpointManager:
         """Get number of processed species for order."""
         return self.order_progress[order]
 
+class HardCheckpointManager(CheckpointManager):
+    """
+    Enhanced checkpoint system with:
+    - species-level resume
+    - offset persistence
+    - crash-safe recovery
+    """
+
+    def __init__(self, checkpoint_file: str):
+        super().__init__(checkpoint_file)
+        self.last_offset: Dict[str, int] = defaultdict(int)
+        self.load_extended()
+
+    def load_extended(self):
+        if self.checkpoint_file.exists():
+            try:
+                with open(self.checkpoint_file, "r") as f:
+                    data = json.load(f)
+
+                    self.processed_ids = set(data.get("processed_ids", []))
+                    self.order_progress = defaultdict(int, data.get("order_progress", {}))
+                    self.last_offset = defaultdict(int, data.get("last_offset", {}))
+
+                logger.info(f"♻️ Hard resume loaded: {len(self.processed_ids)} species")
+
+            except Exception as e:
+                logger.warning(f"Checkpoint load failed: {e}")
+
+    def save(self):
+        try:
+            with open(self.checkpoint_file, "w") as f:
+                json.dump({
+                    "processed_ids": list(self.processed_ids),
+                    "order_progress": dict(self.order_progress),
+                    "last_offset": dict(self.last_offset),
+                    "last_update": datetime.now().isoformat()
+                }, f, indent=2)
+        except Exception as e:
+            logger.error(f"Checkpoint save failed: {e}")
+
+    def set_offset(self, order: str, offset: int):
+        self.last_offset[order] = offset
+
+    def get_offset(self, order: str) -> int:
+        return self.last_offset.get(order, 0)
+    
 # ============================================================================
 # WIKIPEDIA CACHE
 # ============================================================================
@@ -305,38 +353,28 @@ def sync_backbone_keys(order_names: List[str]) -> Dict[str, int]:
 max_offset = 10000  # safety cap to prevent infinite loops
 
 async def fetch_gbif_species(
-    session: aiohttp.ClientSession,
+    session,
     order_name: str,
     order_key: int,
     limit: int,
-    checkpoint: CheckpointManager
-) -> List[Dict]:
-    """
-    Fetch species from GBIF with safe pagination + checkpoint resume.
-    """
+    checkpoint: HardCheckpointManager
+):
 
-    logger.info(f"🌸 Fetching species for {order_name} (Key: {order_key})")
+    logger.info(f"🌸 GBIF streaming: {order_name}")
 
-    all_species = []
-
-    # ✅ DEFINE FIRST (fixes your error)
     batch_size = GBIF_BATCH_SIZE
-    max_offset = 20000  # safety cap
+    max_offset = 200000  # safe ceiling for 3-day run
 
-    # ✅ Resume from checkpoint safely
-    already_processed = checkpoint.get_order_count(order_name)
+    offset = checkpoint.get_offset(order_name)
 
-    if already_processed > 0:
-        logger.info(f"  ↻ Resuming from {already_processed} processed species")
+    logger.info(f"↻ Resume offset: {offset}")
 
-    # Align offset to batch boundary
-    offset = (already_processed // batch_size) * batch_size
+    results_out = []
 
-    while len(all_species) < limit:
+    while len(results_out) < limit:
 
-        # 🚨 SAFETY STOP
         if offset > max_offset:
-            logger.warning(f"  🧯 Offset limit reached ({max_offset}) — stopping")
+            logger.warning("🧯 Max offset hit — stopping safely")
             break
 
         params = {
@@ -353,57 +391,41 @@ async def fetch_gbif_species(
                 GBIF_SPECIES_URL,
                 params=params,
                 timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
-            ) as response:
+            ) as res:
 
-                if response.status != 200:
-                    logger.warning(f"  ⚠️ GBIF returned {response.status} at offset {offset}")
+                if res.status != 200:
+                    logger.warning(f"GBIF error {res.status}")
                     break
 
-                data = await response.json()
-                results = data.get("results", [])
+                data = await res.json()
+                batch = data.get("results", [])
 
-                # ✅ No more pages
-                if not results:
-                    logger.info(f"  ✓ No more results at offset {offset}")
+                if not batch:
                     break
 
-                # ✅ Filter already processed
-                new_results = [
-                    r for r in results
+                new_batch = [
+                    r for r in batch
                     if isinstance(r.get("key"), int)
                     and not checkpoint.is_processed(r["key"])
                 ]
 
-                # 🚨 CRITICAL: prevent infinite scan
-                if not new_results:
-                    logger.info(f"  🛑 No new species at offset {offset} — stopping")
+                if not new_batch:
                     break
 
-                all_species.extend(new_results)
-
-                logger.info(
-                    f"  → Fetched {len(new_results)} new species (offset: {offset})"
-                )
+                results_out.extend(new_batch)
 
                 offset += batch_size
+                checkpoint.set_offset(order_name, offset)
 
-                # Stop if we hit limit
-                if len(all_species) >= limit:
-                    break
-
-                await asyncio.sleep(0.2)
+                await asyncio.sleep(0.25)
 
         except asyncio.TimeoutError:
-            logger.warning(f"  ⏱️ Timeout at offset {offset}")
+            logger.warning("⏱ GBIF timeout — retrying safe break")
             break
 
-        except Exception as e:
-            logger.error(f"  ❌ Error at offset {offset}: {e}")
-            break
+    logger.info(f"✅ GBIF done: {len(results_out)} species")
 
-    logger.info(f"✅ Fetched {len(all_species)} species from {order_name}")
-
-    return all_species[:limit]
+    return results_out[:limit]
 
 async def fetch_gbif_common_name(session, gbif_id: int) -> str:
     """Fetch best common name (prefer English)."""
@@ -525,7 +547,7 @@ INAT_DELAY = 2.0      # was 1.2
 MAX_INITIAL_IMAGES = 2   # Stage 1
 MAX_TOTAL_IMAGES = 3     # Stage 2 ONLY
 
-INAT_TIMEOUT = aiohttp.ClientTimeout(total=40)
+INAT_TIMEOUT = aiohttp.ClientTimeout(total=15)
 
 def normalize_inat_query(name: str) -> Optional[str]:
     """
@@ -551,52 +573,33 @@ def normalize_inat_query(name: str) -> Optional[str]:
     return None
 
 async def fetch_inat_data(session, scientific_name: str):
-    """
-    Production-grade iNaturalist fetch:
-    - GBIF synonym resolution
-    - clean binomial extraction
-    - multi-strategy search
-    - soft matching
-    """
 
     HEADERS = {
         "User-Agent": "CalyxDataBot/2.0 (contact: joemetha97@gmail.com)"
     }
 
-    # =========================
-    # 🔥 STEP 1: CLEAN NAME
-    # =========================
     clean_name = normalize_inat_query(scientific_name)
-
     if not clean_name:
         return fallback_inat("invalid_name")
 
-    # =========================
-    # 🔥 STEP 2: SYNONYM RESOLVE (BIG WIN)
-    # =========================
     resolved_name = await resolve_gbif_synonym(session, clean_name)
-
     if resolved_name:
         clean_name = resolved_name
 
-    # =========================
-    # 🔍 SEARCH STRATEGIES
-    # =========================
     queries = [
         clean_name,
         clean_name.replace("-", " "),
-        clean_name.split()[0]  # genus fallback
+        clean_name.split()[0]
     ]
 
     try:
         taxon = None
 
+        # =========================
+        # 🔍 TAXON SEARCH
+        # =========================
         for q in queries:
-
-            params = {
-                "q": q,
-                "per_page": 5
-            }
+            params = {"q": q, "per_page": 5}
 
             async with session.get(
                 INAT_API_URL,
@@ -604,10 +607,6 @@ async def fetch_inat_data(session, scientific_name: str):
                 headers=HEADERS,
                 timeout=INAT_TIMEOUT
             ) as response:
-
-                if response.status == 429:
-                    await asyncio.sleep(5 + random.uniform(1, 3))
-                    continue
 
                 if response.status != 200:
                     continue
@@ -618,14 +617,11 @@ async def fetch_inat_data(session, scientific_name: str):
                 if not results:
                     continue
 
-                # ✅ soft match first
                 for r in results:
-                    name_match = r.get("name", "").lower()
-                    if clean_name.lower() in name_match:
+                    if clean_name.lower() in r.get("name", "").lower():
                         taxon = r
                         break
 
-                # fallback: first result
                 if not taxon:
                     taxon = results[0]
 
@@ -637,75 +633,127 @@ async def fetch_inat_data(session, scientific_name: str):
 
         taxon_id = taxon.get("id")
 
-        await asyncio.sleep(0.5)
+        # =========================
+        # 📸 TAXON PHOTOS (🔥 NEW)
+        # =========================
+        taxon_photos = []
+        for p in taxon.get("taxon_photos", []):
+            url = p.get("photo", {}).get("medium_url")
+            if url:
+                taxon_photos.append(url)
 
         # =========================
-        # 📸 OBSERVATIONS
+        # 📸 OBSERVATION IMAGES
         # =========================
         obs_url = "https://api.inaturalist.org/v1/observations"
-        obs_params = {
-            "taxon_id": taxon_id,
-            "photos": "true",
-            "per_page": 3
-        }
 
-        image_urls = []
+        research_images = []
+        needs_id_images = []
+        fallback_images = []
 
-        async with session.get(
-            obs_url,
-            params=obs_params,
-            headers=HEADERS,
-            timeout=INAT_TIMEOUT
-        ) as obs_response:
+        try:
+            async with session.get(
+                obs_url,
+                params={
+                    "taxon_id": taxon_id,
+                    "photos": "true",
+                    "per_page": 20
+                },
+                headers=HEADERS,
+                timeout=INAT_TIMEOUT
+            ) as res:
 
-            if obs_response.status == 429:
-                await asyncio.sleep(5 + random.uniform(1, 3))
-                return fallback_inat("rate_limited")
+                if res.status == 200:
+                    data = await res.json()
 
-            if obs_response.status != 200:
-                return fallback_inat("obs_failed")
+                    for obs in data.get("results", []):
+                        quality = obs.get("quality_grade")
 
-            obs_data = await obs_response.json()
+                        for photo in obs.get("photos", []):
+                            url = photo.get("url")
+                            if not url:
+                                continue
 
-            for obs in obs_data.get("results", []):
-                for photo in obs.get("photos", []):
-                    url = photo.get("url")
-                    if url:
-                        image_urls.append(url.replace("square", "medium"))
+                            clean = url.replace("square", "medium")
 
-                    if len(image_urls) >= MAX_INITIAL_IMAGES:
-                        break
-                if len(image_urls) >= MAX_INITIAL_IMAGES:
-                    break
+                            if quality == "research":
+                                research_images.append(clean)
+                            elif quality == "needs_id":
+                                needs_id_images.append(clean)
+                            else:
+                                fallback_images.append(clean)
+
+        except asyncio.TimeoutError:
+            pass
 
         # =========================
-        # 📸 TAXON PHOTO FALLBACK
+        # 🎯 FINAL IMAGE MERGE (🔥 KEY LOGIC)
         # =========================
-        if not image_urls:
-            for photo in taxon.get("taxon_photos", []):
-                url = photo.get("photo", {}).get("medium_url")
-                if url:
-                    image_urls.append(url)
-
-                if len(image_urls) >= MAX_INITIAL_IMAGES:
-                    break
+        final_research = (
+            research_images
+            or needs_id_images
+            or fallback_images
+            or taxon_photos   # 🔥 CRITICAL ADDITION
+        )
 
         return {
             "inat_id": taxon_id,
             "observations": taxon.get("observations_count"),
-            "images": image_urls,
+
+            "research_images": final_research[:3],
+            "needs_id_images": needs_id_images[:3],
+
             "common_name": (
                 taxon.get("preferred_common_name")
                 or taxon.get("english_common_name")
                 or ""
             ),
-            "inat_status": "success" if image_urls else "no_images"
+
+            "inat_status": "success" if final_research else "no_images"
         }
 
-    except Exception:
-        return fallback_inat("exception")
+    except asyncio.TimeoutError:
+        return fallback_inat("timeout")
 
-SEM = asyncio.Semaphore(5)  # tune: 5–10 safe
+    except Exception as e:
+        return fallback_inat(f"error:{str(e)[:30]}")
+    
+
+ # Backoff strategy for iNaturalist fetches 
+async def inat_fetch_with_backoff(session, scientific_name: str, max_retries: int = 3):
+    """
+    Fast, production-safe retry:
+    - short backoff (2s → 4s → 8s)
+    - max 3 retries
+    - avoids pipeline stall
+    """
+
+    delays = [2, 4, 8]
+
+    for attempt in range(max_retries):
+        try:
+            result = await fetch_inat_data(session, scientific_name)
+
+            if isinstance(result, dict):
+                status = result.get("inat_status")
+
+                if status == "success":
+                    return result
+
+                if status in ["no_research_images", "no_images"]:
+                    return result
+
+        except Exception:
+            result = None
+
+        if attempt == max_retries - 1:
+            return fallback_inat("max_retries_exhausted")
+
+        await asyncio.sleep(delays[attempt])
+
+    return fallback_inat("unreachable")
+
+SEM = asyncio.Semaphore(10)  # tune: 5–10 safe
 
 async def process_row(session, df, idx):
     async with SEM:
@@ -773,7 +821,7 @@ async def expand_images(session, taxon_id: int, existing_images: List[str]) -> L
     if len(existing_images) >= MAX_TOTAL_IMAGES:
         return existing_images
 
-    await asyncio.sleep(1.5)  # 🔥 HARD THROTTLE
+    await asyncio.sleep(0.3)  # 🔥 HARD THROTTLE
 
     url = "https://api.inaturalist.org/v1/observations"
     params = {
@@ -852,30 +900,39 @@ def parse_inat_response(data: Dict) -> Dict:
         return fallback_inat()
 
 async def inat_worker(session, result_store, stop_event):
+    """
+    Stable worker with:
+    - queue safety
+    - retry-controlled fetch
+    - crash-safe future handling
+    """
+
     while not stop_event.is_set():
         try:
             species_key, scientific_name, future = await inat_queue.get()
 
             try:
-                result = await fetch_inat_data(session, scientific_name)
-
-                if not isinstance(result, dict):
-                    result = fallback_inat("invalid_response")
+                result = await inat_fetch_with_backoff(
+                    session,
+                    scientific_name,
+                    max_retries=5
+                )
 
                 result_store[species_key] = result
 
-                # ✅ FIX: check before setting
                 if not future.done():
                     future.set_result(result)
 
             except Exception:
-                result = fallback_inat("worker_exception")
+                fallback = fallback_inat("worker_failure")
 
                 if not future.done():
-                    future.set_result(result)
+                    future.set_result(fallback)
 
             finally:
                 inat_queue.task_done()
+
+                # light pacing (keeps AWS / iNat stable)
                 await asyncio.sleep(INAT_DELAY)
 
         except asyncio.CancelledError:
@@ -905,6 +962,7 @@ async def fetch_wikipedia_description(
     cached = cache.get(species_name)
     if cached:
         return cached
+    
     
     timeout = aiohttp.ClientTimeout(total=8)
 
@@ -989,40 +1047,26 @@ async def fetch_wikipedia_description(
 # =========================
 
 def score_image(url: str, info: Dict, species_name: str) -> float:
-    """
-    Improved ranking system for Wikimedia images.
-    No hard filtering — pure scoring.
-    """
-
     score = 0.0
 
-    # =========================
-    # 1. TRUE RESOLUTION (FIXED)
-    # =========================
     width = info.get("width", 0)
     height = info.get("height", 0)
 
+    # resolution = SOFT signal (not filter)
     if width and height:
         megapixels = (width * height) / 1_000_000
-        score += min(megapixels / 2.0, 2.5)  # stronger signal than before
+        score += min(megapixels / 2.0, 2.5)
+    else:
+        score -= 0.5  # unknown size penalty
 
-    # =========================
-    # 2. FILE QUALITY SIGNAL
-    # =========================
     if "upload.wikimedia.org" in url:
         score += 0.8
 
-    # =========================
-    # 3. FILE TYPE BONUS
-    # =========================
     if url.lower().endswith((".jpg", ".jpeg")):
         score += 0.6
     elif url.lower().endswith(".png"):
         score += 0.3
 
-    # =========================
-    # 4. TEXT RELEVANCE (WEAK SIGNAL ONLY)
-    # =========================
     description = (info.get("extmetadata", {})
                    .get("ImageDescription", {})
                    .get("value", "")).lower()
@@ -1039,19 +1083,16 @@ def score_image(url: str, info: Dict, species_name: str) -> float:
         if bn in categories:
             score += 1.2
 
-    # =========================
-    # 5. PENALISE NON-PHOTO CONTENT
-    # =========================
     junk_terms = ["diagram", "map", "chart", "logo", "icon", "drawing", "illustration"]
 
-    if any(k in description for k in junk_terms):
-        score -= 1.5
-
-    if any(k in categories for k in junk_terms):
-        score -= 1.0
+    # SOFT penalties only (no hard rejection)
+    for k in junk_terms:
+        if k in description:
+            score -= 1.0
+        if k in categories:
+            score -= 0.6
 
     return score
-
 
 # =========================
 # 🌿 MAIN FUNCTION (FIXED)
@@ -1188,7 +1229,7 @@ async def fetch_wikimedia_images(session, species_name: str) -> List[str]:
 
 async def fetch_wiki_images_strict(session, species_name: str) -> Tuple[List[str], str]:
 
-    WIKI_API = "https://en.wikipedia.org/w/api.php"
+    API = "https://en.wikipedia.org/w/api.php"
 
     headers = {
         "User-Agent": "CalyxBot/2.0 (contact: youremail@example.com)"
@@ -1199,11 +1240,11 @@ async def fetch_wiki_images_strict(session, species_name: str) -> Tuple[List[str
             "action": "query",
             "titles": title.replace(" ", "_"),
             "prop": "images",
-            "imlimit": 20,
+            "imlimit": 50,
             "format": "json"
         }
 
-        async with session.get(WIKI_API, params=params, headers=headers) as res:
+        async with session.get(API, params=params, headers=headers) as res:
             if res.status != 200:
                 return []
 
@@ -1223,33 +1264,29 @@ async def fetch_wiki_images_strict(session, species_name: str) -> Tuple[List[str
             "format": "json"
         }
 
-        async with session.get(WIKI_API, params=params, headers=headers) as res:
+        async with session.get(API, params=params, headers=headers) as res:
             if res.status != 200:
                 return None
 
             data = await res.json()
             results = data.get("query", {}).get("search", [])
 
-            if results:
-                return results[0]["title"]
+            return results[0]["title"] if results else None
 
-        return None
+    async def resolve_images(image_titles: List[str]) -> List[Dict]:
+        results = []
 
-    async def resolve_images(image_titles: List[str]) -> Tuple[List[str], Dict]:
-        urls = []
-        debug = {"total": 0, "low_res": 0, "bad_keyword": 0, "accepted": 0}
-
-        for title in image_titles[:20]:
+        for title in image_titles[:50]:
             params = {
                 "action": "query",
                 "titles": title,
                 "prop": "imageinfo",
-                "iiprop": "url|extmetadata",
+                "iiprop": "url|size|extmetadata",
                 "format": "json"
             }
 
             try:
-                async with session.get(WIKI_API, params=params, headers=headers) as res:
+                async with session.get(API, params=params, headers=headers) as res:
                     if res.status != 200:
                         continue
 
@@ -1261,106 +1298,63 @@ async def fetch_wiki_images_strict(session, species_name: str) -> Tuple[List[str
                         if not info:
                             continue
 
-                        debug["total"] += 1
+                        i = info[0]
 
-                        meta = info[0].get("extmetadata", {})
-                        url = info[0].get("url")
-
-                        if not url:
-                            continue
-
-                        width = int(meta.get("ImageWidth", {}).get("value", 0))
-                        height = int(meta.get("ImageHeight", {}).get("value", 0))
-
-                        if width < 400 or height < 300:
-                            debug["low_res"] += 1
-                            continue
-
-                        description = meta.get("ImageDescription", {}).get("value", "").lower()
-
-                        if any(k in description for k in ["diagram", "map", "chart", "logo"]):
-                            debug["bad_keyword"] += 1
-                            continue
-
-                        if url.lower().endswith((".jpg", ".jpeg", ".png")):
-                            urls.append(url)
-                            debug["accepted"] += 1
-
-                        if len(urls) >= 5:
-                            return urls, debug
+                        results.append({
+                            "url": i.get("url"),
+                            "width": i.get("width", 0),
+                            "height": i.get("height", 0),
+                            "extmetadata": i.get("extmetadata", {})
+                        })
 
             except Exception:
                 continue
 
-        return urls, debug
+        return results
 
-    # =========================
-    # ✅ MAIN EXECUTION (FIXED INDENTATION)
-    # =========================
     try:
         image_titles = await get_page_images(species_name)
 
         if not image_titles:
-            alt_title = await search_fallback(species_name)
-            if alt_title:
-                image_titles = await get_page_images(alt_title)
+            alt = await search_fallback(species_name)
+            if alt:
+                image_titles = await get_page_images(alt)
 
         if not image_titles:
             return [], "no_titles"
 
-        image_urls, debug = await resolve_images(image_titles)
+        raw_images = await resolve_images(image_titles)
 
-        print(
-            f"[WIKI DEBUG] {species_name} | "
-            f"total={debug['total']} "
-            f"accepted={debug['accepted']} "
-            f"low_res={debug['low_res']} "
-            f"bad={debug['bad_keyword']}"
-        )
+        if not raw_images:
+            return [], "no_images"
 
-        if image_urls:
-            return image_urls, "success"
+        scored = []
+        for img in raw_images:
+            if not img["url"]:
+                continue
 
-        if debug["total"] == 0:
-            return [], "no_images_found"
+            score = score_image(img["url"], img, species_name)
+            scored.append((score, img["url"]))
 
-        return [], f"filtered_out({debug})"
+        scored.sort(reverse=True, key=lambda x: x[0])
+
+        final = []
+        seen = set()
+
+        for _, url in scored:
+            clean = url.split("?")[0]
+            if clean not in seen:
+                seen.add(clean)
+                final.append(clean)
+
+            if len(final) >= 5:
+                break
+
+        return final, "success"
 
     except Exception as e:
         print(f"[WIKI IMG ERROR] {species_name}: {e}")
         return [], "exception"
-
-    return [], "unknown"
-        
-    
-# ============================================================================
-#   IMAGE JSON MERGE LOGIC
-# ============================================================================
-
-def merge_images(inat_images: List[str], wiki_images: List[str]) -> List[str]:
-    """Strict merge with priority + dedupe"""
-
-    seen = set()
-    merged = []
-
-    # iNat always first
-    for url in inat_images:
-        clean = url.split("?")[0]
-        if clean not in seen:
-            seen.add(clean)
-            merged.append(clean)
-
-    # Only add wiki if exists
-    for url in wiki_images:
-        clean = url.split("?")[0]
-        if clean not in seen:
-            seen.add(clean)
-            merged.append(clean)
-
-        if len(merged) >= 5:
-            break
-
-    return merged
 
 # ============================================================================
 # ASYNC RETRY LOGIC
@@ -1459,53 +1453,30 @@ async def process_species(
     binomial = extract_binomial(canonical_name) or canonical_name
 
     # =========================
-    # iNaturalist (queued)
+    # iNat FETCH (FIRST)
     # =========================
-    loop = asyncio.get_running_loop()
-    future = loop.create_future()
 
-    await inat_queue.put((species_key, binomial, future))
+    try:
+        inat_data = await asyncio.wait_for(
+            inat_fetch_with_backoff(session, binomial),
+            timeout=20
+        )
+    except asyncio.TimeoutError:
+        inat_data = fallback_inat("hard_timeout")
 
-    MAX_INAT_RETRIES = 3
-
-    inat_data = None
-
-    for attempt in range(MAX_INAT_RETRIES):
-        loop = asyncio.get_running_loop()
-        future = loop.create_future()
-
-        await inat_queue.put((species_key, binomial, future))
-
-        try:
-            inat_data = await asyncio.wait_for(future, timeout=25)
-
-            status = inat_data.get("inat_status")
-
-            # ✅ SUCCESS → break immediately
-            if status == "success":
-                break
-
-            # 🔁 RETRY conditions
-            if status in ["timeout", "rate_limited"]:
-                await asyncio.sleep(2 * (attempt + 1))
-                continue
-
-            # ❌ NON-RETRYABLE
-            break
-
-        except asyncio.TimeoutError:
-            if attempt < MAX_INAT_RETRIES - 1:
-                await asyncio.sleep(2 * (attempt + 1))
-                continue
-            else:
-                inat_data = fallback_inat("timeout")
-
-    # fallback safety
     if not isinstance(inat_data, dict):
         inat_data = fallback_inat("invalid")
 
+    if not isinstance(inat_data, dict):
+        inat_data = fallback_inat("invalid")
+
+    # ✅ SAFE extraction AFTER assignment
+    inat_research = inat_data.get("research_images", [])
+    inat_needs = inat_data.get("needs_id_images", [])
+
+
     # =========================
-    # Wikipedia DESCRIPTION (FIXED)
+    # WIKIPEDIA
     # =========================
     desc_res = await retry_async(
         fetch_wikipedia_description,
@@ -1519,48 +1490,21 @@ async def process_species(
     else:
         description, source = "Description not found.", "none"
 
-    # =========================
-    # Wikipedia IMAGES
-    # =========================
     wiki_result = await retry_async(
         fetch_wiki_images_strict,
         session, canonical_name,
-        expected_type=tuple
+        validator=lambda r: isinstance(r, tuple)
     )
 
     if isinstance(wiki_result, tuple):
-        wiki_images, wiki_reason = wiki_result
+        wiki_images, _ = wiki_result
     else:
-        wiki_images, wiki_reason = [], "invalid"
+        wiki_images = []
 
     # =========================
-    # IMAGE MERGE (FIXED: USE YOUR FUNCTION)
+    # ✅ NEW IMAGE FLAG
     # =========================
-    merged_urls = merge_images(
-        inat_data.get("images", []),
-        wiki_images
-    )
-
-    final_images = [
-        {
-            "url": url,
-            "source": "inat" if url in inat_data.get("images", []) else "wiki"
-        }
-        for url in merged_urls[:MAX_TOTAL_IMAGES]
-    ]
-
-    has_images = len(final_images) > 0
-
-    # =========================
-    # DEBUG (clean + useful)
-    # =========================
-    print(
-        f"[MERGE] {canonical_name} | "
-        f"inat={len(inat_data.get('images', []))} "
-        f"wiki={len(wiki_images)} "
-        f"final={len(final_images)} "
-        f"reason={wiki_reason}"
-    )
+    has_images = bool(inat_research or wiki_images)
 
     # =========================
     # BUILD RECORD
@@ -1580,9 +1524,14 @@ async def process_species(
         gbif_id=species_key or 0,
         inat_id=inat_data.get("inat_id"),
         observation_count=inat_data.get("observations"),
-        wikipedia_description=description,        # ✅ FIXED
-        description_source=source,                # ✅ FIXED
-        image_urls=json.dumps(final_images),
+        wikipedia_description=description,
+        description_source=source,
+
+        # 🔥 NEW STRUCTURE
+        inat_research_images=json.dumps(inat_research),
+        inat_needs_id_images=json.dumps(inat_needs),
+        wiki_images=json.dumps(wiki_images),
+
         extraction_timestamp=datetime.now().isoformat(),
         inat_status=inat_data.get("inat_status", "unknown"),
         has_images=has_images
@@ -1652,7 +1601,7 @@ async def extract_order_parallel(
     order_name: str,
     order_key: int,
     limit_per_order: int,
-    checkpoint: CheckpointManager,
+    checkpoint: HardCheckpointManager,
     wiki_cache: WikipediaCache,
     csv_writer: StreamingCSVWriter
 ):
@@ -1676,16 +1625,6 @@ async def extract_order_parallel(
 
         logger.info(f"🔄 Processing {len(species_list)} species")
 
-        # 🔥 shared result store
-        inat_results = {}
-
-        # 🔥 start workers
-        stop_event = asyncio.Event()
-
-        workers = [
-            asyncio.create_task(inat_worker(session, inat_results, stop_event))
-            for _ in range(INAT_WORKERS)
-        ]
 
         processed_count = 0
         wiki_semaphore = asyncio.Semaphore(MAX_CONCURRENT_WIKI)
@@ -1768,14 +1707,6 @@ async def extract_order_parallel(
             # 🔥 COOL DOWN (prevents API burst detection)
             await asyncio.sleep(1)
 
-        # 🔥 wait for queue to drain
-        await inat_queue.join()
-
-        stop_event.set()
-
-        for w in workers:
-            w.cancel()
-
         checkpoint.save()
         wiki_cache.save()
 
@@ -1788,7 +1719,7 @@ async def extract_order_parallel(
 async def extract_batch(
     batch_num: int,
     limit_per_order: int,
-    checkpoint: CheckpointManager,
+    checkpoint: HardCheckpointManager,
     wiki_cache: WikipediaCache,
     csv_writer: StreamingCSVWriter
 ):
@@ -1875,7 +1806,7 @@ Examples:
     logger = setup_logging(args.log_file)
 
     # Init components
-    checkpoint = CheckpointManager(args.checkpoint)
+    checkpoint = HardCheckpointManager(args.checkpoint)
     wiki_cache = WikipediaCache()
     csv_writer = StreamingCSVWriter(args.output)
 
