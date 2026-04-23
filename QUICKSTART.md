@@ -1,155 +1,140 @@
-# 🚀 Quick Start Guide
+# 🚀 Calyx Pipeline Quickstart (Google Cloud + Docker)
 
-## Installation (30 seconds)
-
-```bash
-# Install dependencies
-pip install aiohttp pandas requests
-
-# Download script
-# (already have calyx_production.py)
-
-# Ready to run!
-```
-
-## First Run (5 minutes)
-
-### Test with Small Sample
-```bash
-python calyx_production.py --batch 1 --limit 100
-```
-
-**Expected output:**
-```
-🌺 CALYX PRODUCTION DATA EXTRACTION PIPELINE 🌺
-Output: calyx_species_data.csv
-Checkpoint: calyx_checkpoint.json
-Limit per order: 100
-
-🔍 Resolving 2 order keys from GBIF Backbone...
-  ✅ Asparagales: 769
-  ✅ Liliales: 785
-
-============================================================
-Processing Order: Asparagales
-============================================================
-🌸 Fetching species for Asparagales (Key: 769)
-  → Fetched 100 new species (offset: 100)
-✅ Fetched 100 species from Asparagales
-🔄 Processing 100 species with Wikipedia enrichment...
-  ✓ Processed 100/100 species
-✅ Completed Asparagales: 100 species
-
-✨ EXTRACTION COMPLETE!
-📁 Output: calyx_species_data.csv
-⏱️  Time: 2.5 minutes
-```
-
-### Check Output
-```bash
-# View first 10 rows
-head -20 calyx_species_data.csv
-
-# Count rows
-wc -l calyx_species_data.csv
-```
-
-## Production Run
-
-### Single Batch (~2 hours, ~10k species)
-```bash
-python calyx_production.py --batch 1 --limit 5000
-```
-
-### All Batches (~50 hours, ~300k species)
-```bash
-# Run in background
-nohup python calyx_production.py --all --limit 50000 > extraction.log 2>&1 &
-
-# Monitor progress
-tail -f extraction.log
-
-# Check job status
-ps aux | grep calyx
-```
-
-## Resume After Interruption
-
-```bash
-# Just re-run the same command
-python calyx_production.py --batch 1 --limit 5000
-
-# Automatic resume - skips processed species
-```
-
-## Files Generated
-
-```
-calyx_species_data.csv       ← YOUR DATA
-calyx_checkpoint.json        ← Resume state
-wiki_cache.json              ← Speed optimization
-extraction.log               ← Detailed logs (optional)
-```
-
-## Quick Commands
-
-```bash
-# Count processed species
-wc -l calyx_species_data.csv
-
-# View checkpoint status
-cat calyx_checkpoint.json | python -m json.tool
-
-# Check Wikipedia cache size
-du -h wiki_cache.json
-
-# Monitor real-time
-watch -n 5 'wc -l calyx_species_data.csv'
-```
-
-## Common Patterns
-
-### Extract Specific Orders
-```bash
-python calyx_production.py --orders Asterales Rosales Fabales --limit 10000
-```
-
-### Custom Output Location
-```bash
-python calyx_production.py \
-  --batch 3 \
-  --limit 15000 \
-  --output /data/flowers_batch3.csv \
-  --checkpoint /data/checkpoint_b3.json
-```
-
-### With Logging
-```bash
-python calyx_production.py \
-  --all \
-  --limit 50000 \
-  --log-file full_extraction.log
-```
-
-## Performance Tips
-
-**For Oracle Free Server:**
-- Use `--limit 5000` per order (safe)
-- Run one batch at a time
-- Monitor disk space: `df -h`
-
-**For Dedicated Server:**
-- Use `--limit 15000` per order
-- Can handle `--all` flag
-- Increase Wikipedia workers (edit script)
-
-## Need Help?
-
-1. **Check logs:** `cat extraction.log`
-2. **Verify checkpoint:** `cat calyx_checkpoint.json`
-3. **Count records:** `wc -l calyx_species_data.csv`
-4. **Restart:** Just re-run the command (auto-resumes)
+This guide gets you from zero → running pipeline on a Google server.
 
 ---
 
-That's it! You're ready to extract. 🌸
+## 1️⃣ Prerequisites
+
+- Google Cloud account
+- Billing enabled
+- gcloud CLI installed
+
+---
+
+## 2️⃣ Create VM Instance
+gcloud compute instances create calyx-runner \
+  --zone=us-central1-a \
+  --machine-type=e2-standard-4 \
+  --boot-disk-size=50GB \
+  --image-family=debian-11 \
+  --image-project=debian-cloud
+
+---
+
+## 3️⃣ SSH Into Server
+
+gcloud compute ssh calyx-runner
+
+---
+
+## 4️⃣ Install Docker
+
+sudo apt update
+sudo apt install -y docker.io
+sudo systemctl start docker
+sudo systemctl enable docker
+
+Optional (no sudo):
+
+sudo usermod -aG docker $USER
+newgrp docker
+
+---
+
+## 5️⃣ Upload Your Project
+
+From local machine:
+
+gcloud compute scp --recurse ./calyx-project calyx-runner:~/
+
+SSH back in:
+
+cd ~/calyx-project
+
+---
+
+## 6️⃣ Build Docker Image
+
+docker build -t calyx-pipeline .
+
+---
+
+## 7️⃣ Run Pipeline (Basic)
+
+docker run -it calyx-pipeline
+
+---
+
+## 8️⃣ Run With Persistent Storage (IMPORTANT)
+
+docker run -it \
+  -v $(pwd)/data:/app \
+  calyx-pipeline
+
+This preserves:
+
+CSV output
+checkpoint file
+cache
+
+---
+
+## 9️⃣ Resume Mode (CRITICAL)
+
+docker run -it \
+  -v $(pwd)/data:/app \
+  calyx-pipeline \
+  python calyx_production.py --batch 1 --resume
+
+---
+
+## 🔟 Production Run (Recommended)
+
+docker run -d \
+  -v $(pwd)/data:/app \
+  calyx-pipeline \
+  python calyx_production.py --batch 1 --limit 200000 --resume
+📊 Monitor Logs
+docker logs -f <container_id>
+🧯 Stop Container
+docker stop <container_id>
+📁 Output Files
+
+Inside /data:
+
+calyx_species_data.csv
+calyx_checkpoint.json
+wiki_cache.json
+⚙️ Tuning Tips
+Parameter	Effect
+--limit	species per order
+INAT_DELAY	API stability
+INAT_WORKERS	speed vs rate-limit
+chunk_size	memory vs throughput
+
+## 🚨 Common Issues
+1. No images
+Normal for rare species
+2. Slow performance
+Reduce INAT_DELAY slightly
+Increase VM size
+3. Restart needed
+Use --resume
+
+💡 Recommended VM Specs
+Scale	Machine
+Testing	e2-standard-2
+Production	e2-standard-4+
+Heavy runs	e2-highmem-8
+
+🧠 Pro Tip
+
+Run overnight with:
+
+--resume + high limit
+
+The pipeline is built for long-haul extraction.
+
+
+✅ You're Good To Go
