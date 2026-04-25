@@ -359,14 +359,20 @@ async def fetch_gbif_species(
     limit: int,
     checkpoint: HardCheckpointManager
 ):
+    """
+    FIXED VERSION:
+    - NEVER breaks on empty filtered batches
+    - Always advances offset
+    - Proper resume behaviour
+    - Prevents silent stalls
+    """
 
     logger.info(f"🌸 GBIF streaming: {order_name}")
 
     batch_size = GBIF_BATCH_SIZE
-    max_offset = 200000  # safe ceiling for 3-day run
+    max_offset = 200000  # safety ceiling
 
     offset = checkpoint.get_offset(order_name)
-
     logger.info(f"↻ Resume offset: {offset}")
 
     results_out = []
@@ -401,27 +407,40 @@ async def fetch_gbif_species(
                 batch = data.get("results", [])
 
                 if not batch:
+                    logger.info("📭 No more results from GBIF")
                     break
 
+                # 🔥 FILTER OUT PROCESSED
                 new_batch = [
                     r for r in batch
                     if isinstance(r.get("key"), int)
                     and not checkpoint.is_processed(r["key"])
                 ]
 
+                # 🔥 CRITICAL FIX: DO NOT BREAK
                 if not new_batch:
-                    break
+                    logger.debug(f"⏭ Skipping offset {offset} (all processed)")
+                else:
+                    results_out.extend(new_batch)
 
-                results_out.extend(new_batch)
-
+                # 🔥 ALWAYS MOVE FORWARD
                 offset += batch_size
                 checkpoint.set_offset(order_name, offset)
 
+                # throttle
                 await asyncio.sleep(0.25)
 
         except asyncio.TimeoutError:
-            logger.warning("⏱ GBIF timeout — retrying safe break")
-            break
+            logger.warning("⏱ GBIF timeout — continuing")
+            offset += batch_size
+            checkpoint.set_offset(order_name, offset)
+            continue
+
+        except Exception as e:
+            logger.warning(f"⚠️ GBIF error: {e}")
+            offset += batch_size
+            checkpoint.set_offset(order_name, offset)
+            continue
 
     logger.info(f"✅ GBIF done: {len(results_out)} species")
 
@@ -537,7 +556,7 @@ def extract_binomial(name: str) -> Optional[str]:
 # ============================================================================
 # ASYNC INATURALIST FETCHER
 # ============================================================================
-
+global inat_queue
 inat_queue = asyncio.Queue()
 REQUEST_TIMEOUT = 25  # was 15
 
@@ -753,7 +772,7 @@ async def inat_fetch_with_backoff(session, scientific_name: str, max_retries: in
 
     return fallback_inat("unreachable")
 
-SEM = asyncio.Semaphore(10)  # tune: 5–10 safe
+SEM = asyncio.Semaphore(40)
 
 async def process_row(session, df, idx):
     async with SEM:
@@ -1443,40 +1462,28 @@ async def process_species(
     species_data: Dict,
     order_name: str,
     session: aiohttp.ClientSession,
-    wiki_cache: WikipediaCache
+    wiki_cache: WikipediaCache,
+    inat_futures: Dict[int, asyncio.Future]
 ) -> SpeciesRecord:
 
     canonical_name = species_data.get("canonicalName") or ""
     genus = species_data.get("genus") or ""
     species_key = species_data.get("key")
 
+    if not isinstance(species_key, int):
+        species_key = 0
+
     binomial = extract_binomial(canonical_name) or canonical_name
 
-    # =========================
-    # iNat FETCH (FIRST)
-    # =========================
+    loop = asyncio.get_event_loop()
+    future = loop.create_future()
 
-    try:
-        inat_data = await asyncio.wait_for(
-            inat_fetch_with_backoff(session, binomial),
-            timeout=20
-        )
-    except asyncio.TimeoutError:
-        inat_data = fallback_inat("hard_timeout")
-
-    if not isinstance(inat_data, dict):
-        inat_data = fallback_inat("invalid")
-
-    if not isinstance(inat_data, dict):
-        inat_data = fallback_inat("invalid")
-
-    # ✅ SAFE extraction AFTER assignment
-    inat_research = inat_data.get("research_images", [])
-    inat_needs = inat_data.get("needs_id_images", [])
-
+    # ✅ ONLY PUT (DO NOT GET)
+    inat_futures[species_key] = future
+    await inat_queue.put((species_key, binomial, future))
 
     # =========================
-    # WIKIPEDIA
+    # ⚡ FAST TASKS (parallel)
     # =========================
     desc_res = await retry_async(
         fetch_wikipedia_description,
@@ -1502,13 +1509,21 @@ async def process_species(
         wiki_images = []
 
     # =========================
-    # ✅ NEW IMAGE FLAG
+    # 🐢 WAIT FOR iNat RESULT
     # =========================
+    try:
+        inat_data = await asyncio.wait_for(future, timeout=25)
+    except asyncio.TimeoutError:
+        inat_data = fallback_inat("timeout")
+
+    if not isinstance(inat_data, dict):
+        inat_data = fallback_inat("invalid")
+
+    inat_research = inat_data.get("research_images", [])
+    inat_needs = inat_data.get("needs_id_images", [])
+
     has_images = bool(inat_research or wiki_images)
 
-    # =========================
-    # BUILD RECORD
-    # =========================
     name_parts = canonical_name.split()
     species = name_parts[1] if len(name_parts) > 1 else ""
 
@@ -1526,12 +1541,9 @@ async def process_species(
         observation_count=inat_data.get("observations"),
         wikipedia_description=description,
         description_source=source,
-
-        # 🔥 NEW STRUCTURE
         inat_research_images=json.dumps(inat_research),
         inat_needs_id_images=json.dumps(inat_needs),
         wiki_images=json.dumps(wiki_images),
-
         extraction_timestamp=datetime.now().isoformat(),
         inat_status=inat_data.get("inat_status", "unknown"),
         has_images=has_images
@@ -1545,10 +1557,18 @@ class StreamingCSVWriter:
     def __init__(self, output_file: str):
         self.output_file = Path(output_file)
 
-        # ✅ Determine upfront if file already has data
-        self.header_written = (
-            self.output_file.exists() and self.output_file.stat().st_size > 0
-        )
+        # ✅ Only treat as written if file has real content
+        self.header_written = False
+
+        if self.output_file.exists():
+            try:
+                if self.output_file.stat().st_size > 0:
+                    # Try reading header safely
+                    df = pd.read_csv(self.output_file, nrows=1)
+                    if len(df.columns) > 0:
+                        self.header_written = True
+            except Exception:
+                self.header_written = False
 
     def write_batch(self, records: List[SpeciesRecord]):
         if not records:
@@ -1556,7 +1576,7 @@ class StreamingCSVWriter:
 
         df = pd.DataFrame([r.to_dict() for r in records])
 
-        # ✅ Always append, control header explicitly
+        # ✅ Write header ONLY once, correctly
         df.to_csv(
             self.output_file,
             mode='a',
@@ -1610,7 +1630,7 @@ async def extract_order_parallel(
     logger.info(f"Processing Order: {order_name}")
     logger.info(f"{'='*60}")
 
-    connector = aiohttp.TCPConnector(limit=50)
+    connector = aiohttp.TCPConnector(limit=120)
     timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
 
     async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
@@ -1625,87 +1645,76 @@ async def extract_order_parallel(
 
         logger.info(f"🔄 Processing {len(species_list)} species")
 
+        # 🔥 CONCURRENCY CONTROL
+        SEM = asyncio.Semaphore(20)   # ← BIG upgrade from 3
+
+        inat_futures = {}
+        inat_results = {}
+        stop_event = asyncio.Event()
+
+        # 🔥 Start iNat workers
+        inat_workers = [
+            asyncio.create_task(inat_worker(session, inat_results, stop_event))
+            for _ in range(INAT_WORKERS)
+        ]
+
+        async def worker(sp):
+            async with SEM:
+                try:
+                    return await process_species(
+                        sp,
+                        order_name,
+                        session,
+                        wiki_cache,
+                        inat_futures   # 🔥 NEW
+                    )
+                except Exception:
+                    return None
+
+        tasks = [worker(sp) for sp in species_list]
 
         processed_count = 0
-        wiki_semaphore = asyncio.Semaphore(MAX_CONCURRENT_WIKI)
+        checkpoint_counter = 0
+        buffer = []
 
-        async def process_with_semaphore(sp):
-            async with wiki_semaphore:
-                return await process_species(
-                    sp,
-                    order_name,
-                    session,
-                    wiki_cache,
-                )
+        # 🔥 STREAM RESULTS (NO WAITING FOR ALL)
+        for future in asyncio.as_completed(tasks):
+            result = await future
 
-        chunk_size = 100
+            if isinstance(result, SpeciesRecord):
+                buffer.append(result)
+                checkpoint.mark_processed(result.gbif_id, order_name)
 
-        for i in range(0, len(species_list), chunk_size):
-            chunk = species_list[i:i + chunk_size]
+                processed_count += 1
+                checkpoint_counter += 1
 
-            tasks = [process_with_semaphore(sp) for sp in chunk]
-            records = await asyncio.gather(*tasks, return_exceptions=True)
+            # 🔥 WRITE IN SMALL BATCHES
+            if len(buffer) >= 50:
+                csv_writer.write_batch(buffer)
+                buffer.clear()
 
-            valid_records = [r for r in records if isinstance(r, SpeciesRecord)]
-
-            csv_writer.write_batch(valid_records)
-
-            for r in valid_records:
-                checkpoint.mark_processed(r.gbif_id, order_name)
-
-            processed_count += len(valid_records)
-
-            if processed_count % CHECKPOINT_INTERVAL == 0:
+            # 🔥 HARD CHECKPOINT EVERY 500
+            if checkpoint_counter >= CHECKPOINT_INTERVAL:
                 checkpoint.save()
                 wiki_cache.save()
-                logger.info(f"💾 Checkpoint saved: {processed_count}")
+                logger.info(f"💾 Checkpoint saved at {processed_count}")
+                checkpoint_counter = 0
 
-            logger.info(f"✓ {processed_count}/{len(species_list)}")
+            if processed_count % 50 == 0:
+                logger.info(f"✓ {processed_count}/{len(species_list)}")
 
-            # 🔥 COOL DOWN (prevents API burst detection)
-            await asyncio.sleep(1)
+        # flush remaining
+        if buffer:
+            csv_writer.write_batch(buffer)
 
-            # 🧊 COOL DOWN BEFORE RETRY (PREVENT API HAMMERING)
-            await asyncio.sleep(5)
+        # wait for queue to finish
+        await inat_queue.join()
 
-            # =========================
-            # 🔁 RETRY PASS (CRITICAL FIX)
-            # =========================
+        # stop workers
+        stop_event.set()
 
-            logger.info("🔁 Starting retry pass for failed iNat records...")
-
-            retry_species = [
-                sp for sp in species_list
-                if isinstance(sp.get("key"), int)
-                and not checkpoint.is_processed(sp["key"])
-            ]
-
-            if retry_species:
-                logger.info(f"🔄 Retrying {len(retry_species)} failed species")
-
-                retry_tasks = [
-                    process_with_semaphore(sp)
-                    for sp in retry_species
-                ]
-
-                retry_results = await asyncio.gather(*retry_tasks, return_exceptions=True)
-
-                retry_valid = [
-                    r for r in retry_results
-                    if isinstance(r, SpeciesRecord)
-                ]
-
-                csv_writer.write_batch(retry_valid)
-
-                for r in retry_valid:
-                    checkpoint.mark_processed(r.gbif_id, order_name)
-
-                logger.info(f"✅ Retry recovered {len(retry_valid)} species")
-            else:
-                logger.info("✅ No retry needed")
-
-            # 🔥 COOL DOWN (prevents API burst detection)
-            await asyncio.sleep(1)
+        for w in inat_workers:
+            w.cancel()
 
         checkpoint.save()
         wiki_cache.save()
@@ -1778,8 +1787,8 @@ Examples:
     # 👇 change default to None so we can control it
     parser.add_argument('--limit', type=int, default=None)
 
-    parser.add_argument('--output', type=str, default='calyx_species_data.csv')
-    parser.add_argument('--checkpoint', type=str, default='calyx_checkpoint.json')
+    parser.add_argument('--output', type=str, default='/data/calyx_species_data.csv')
+    parser.add_argument('--checkpoint', type=str, default='/data/calyx_checkpoint.json')
     parser.add_argument('--log-file', type=str)
     parser.add_argument('--resume', action='store_true')
 
@@ -1807,7 +1816,7 @@ Examples:
 
     # Init components
     checkpoint = HardCheckpointManager(args.checkpoint)
-    wiki_cache = WikipediaCache()
+    wiki_cache = WikipediaCache("/data/wiki_cache.json")
     csv_writer = StreamingCSVWriter(args.output)
 
     logger.info("🌺 CALYX PRODUCTION DATA EXTRACTION PIPELINE 🌺")
