@@ -32,6 +32,8 @@ from dataclasses import dataclass, asdict
 from collections import defaultdict
 import time
 
+from pathlib import Path
+
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
@@ -41,6 +43,8 @@ GBIF_MATCH_URL = "https://api.gbif.org/v1/species/match"
 WIKI_API_URL = "https://en.wikipedia.org/api/rest_v1/page/summary/"
 GBIF_BACKBONE_KEY = "d7dddbf4-2cf0-4f39-9b2a-bb099caae36c"
 INAT_API_URL = "https://api.inaturalist.org/v1/taxa"
+
+OUTPUT_DIR = Path(__file__).parent / "data"
 
 # Taxonomic orders organized by batch
 BATCH_ORDER_NAMES = {
@@ -1787,8 +1791,8 @@ Examples:
     # 👇 change default to None so we can control it
     parser.add_argument('--limit', type=int, default=None)
 
-    parser.add_argument('--output', type=str, default='/data/calyx_species_data.csv')
-    parser.add_argument('--checkpoint', type=str, default='/data/calyx_checkpoint.json')
+    parser.add_argument('--output', type=str, default='data/calyx_species_data.csv')
+    parser.add_argument('--checkpoint', type=str, default='data/calyx_checkpoint.json')
     parser.add_argument('--log-file', type=str)
     parser.add_argument('--resume', action='store_true')
 
@@ -1816,7 +1820,7 @@ Examples:
 
     # Init components
     checkpoint = HardCheckpointManager(args.checkpoint)
-    wiki_cache = WikipediaCache("/data/wiki_cache.json")
+    wiki_cache = WikipediaCache("data/wiki_cache.json")
     csv_writer = StreamingCSVWriter(args.output)
 
     logger.info("🌺 CALYX PRODUCTION DATA EXTRACTION PIPELINE 🌺")

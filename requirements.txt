@@ -1,3 +1,7 @@
 aiohttp
 requests
 pandas
+psycopg2-binary
+sqlalchemy
+python-dotenv
+asyncpg
